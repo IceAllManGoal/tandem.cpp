@@ -23,11 +23,20 @@ We tuned for Qwen3.8 only, but other MoE models that do not fit in VRAM gain too
 
 For a big card serving many concurrent streams, use [Tandem-vLLM](https://github.com/ewhacc/tandem) instead; tandem.cpp is for one user on a 16–32 GB card with the experts in RAM.
 
-> **Known issue (2026-11-15): 128 GB RAM with a model bigger than RAM (e.g. DeepSeek-V4.1).** The RAM store sizes itself
-> too close to all of RAM, and the server is killed at load or the PC stops responding. Until the fix, start the server
-> with `LLAMA_MOE_STORE_AUTO=0` (this is how the 33.1 tok/s DeepSeek-V4.1 row was measured). Our 32 and 64 GB test PCs were not affected.
+## What's new (2026-11-15, second update)
 
-## What's new (2026-11-15)
+- **Fixed: 128 GB of RAM with a model bigger than RAM (e.g. DeepSeek-V4.1) was killed at load or hung the PC.** On the Linux 7.0
+  kernels we tested, part of RAM is a region that pinned memory cannot use (9 GiB on a 128 GB PC), but the kernel counts it as free, and
+  the RAM store took it. The store now leaves it out and keeps 2 GiB + 1/64 of RAM free. It also switches on only where it
+  helps: when it can hold every expert, or when the experts are larger than RAM. DeepSeek-V4.1 on 128 GB + RTX 5090 runs in
+  mmap mode again (31.4 tok/s in today's check; the table row is 33.1, Strata 28.0). `LLAMA_MOE_STORE_AUTO=0` is no longer needed.
+- **A big card in a small PC: VRAM and RAM hold every expert.** When the VRAM cache plus the RAM store can hold all the
+  experts, they are placed at start (as many as fit in VRAM, the rest in RAM) and nothing is read from the SSD after that. Qwen3.8
+  IQ3_S + MTP (78 GiB) on a 32 GB PC with an RTX 5090: **147 tok/s, up from 75**, first token 0.45 s;
+  Strata 153–158 on the same PC (0.95×).
+- **Faster first token in store mode.** Each expert upload's padding was read from the file, an SSD read per expert.
+
+## Earlier (2026-11-15)
 
 - **Faster GPU work between the routing steps, on NVIDIA and AMD.** Three kernel changes in the shared CUDA/HIP code: the
   routing results come back to the CPU in one copy instead of three, a faster hyper-connection mixing kernel, and fused
@@ -224,9 +233,10 @@ The server applies these when the variable is unset (logged at startup); `VAR=0`
 | `LLAMA_MOE_PREFILL_CPU` | `auto` | the split for prompt batches |
 | `LLAMA_MOE_CPU_THREADS` | cores − 1 | CPU threads for missed experts |
 | `LLAMA_MOE_CPU_RB`, `LLAMA_MOE_CPU_DOWN_PE` | `64`, `64` | CPU expert job work-item layout |
-| `LLAMA_MOE_STORE_AUTO` | `1` | store mode (below) when the experts outside VRAM exceed 85% of the RAM and `LLAMA_MOE_ARENA_MIB` is unset |
+| `LLAMA_MOE_STORE_AUTO` | `1` | store mode (below) when `LLAMA_MOE_ARENA_MIB` is unset and either the experts outside VRAM exceed the RAM, or all experts exceed 85% of the RAM and VRAM + the block can hold every one |
 | `LLAMA_MOE_ARENA_MIB` | unset | `auto` forces store mode: the experts outside VRAM live in one pinned block of RAM (the whole RAM less the reserve), read with direct I/O |
-| `LLAMA_MOE_ARENA_RESERVE_MIB` | `2048` | store mode: RAM left free |
+| `LLAMA_MOE_ARENA_RESERVE_MIB` | 2048 + RAM/64 | store mode: RAM left free (on top of the kernel's CMA region, which pinned memory cannot use) |
+| `LLAMA_MOE_ARENA_FILL` | `1` | store mode: when VRAM + the block hold every expert, place them all at start (then every miss is uploaded, no CPU share) |
 | `LLAMA_MOE_ARENA_EXCL` | `1` | store mode: an expert is in VRAM or in the block, not both; the VRAM victim is copied back to RAM |
 | `LLAMA_MOE_ARENA_ASYNC` | `1` | store mode: decode reads from the SSD overlap the compute |
 | `LLAMA_MOE_PIN_EXPS` | auto | mmap mode: copy the mapped experts to pinned memory when the RAM holds them + 10 GiB |
@@ -370,7 +380,6 @@ With the defaults off the patch computes exactly what llama.cpp does; the defaul
 - Linux only. Tuned and tested on NVIDIA (CUDA). AMD (ROCm) works and gets the shared kernel work, but it has had less tuning and was tested on one RX 7900 XTX ([above](#amd-gpus-rocm)).
 - Qwen3.8 GGUFs converted with a current llama.cpp may be a little slower than the ISTA files we measured (one fusion does not apply to their layout).
 - Known issues, to be fixed:
-  - 128 GB RAM with a model bigger than RAM: killed at load or the PC hangs; set `LLAMA_MOE_STORE_AUTO=0` ([above](#whats-new-2026-11-15));
   - models much larger than RAM (read from the SSD) depend on the drive (see the gaming-PC rows for a PCIe 4.0 drive);
   - DeepSeek-V4.1 with `-lm none` loads very slowly (its 103 GiB Engram tables are copied page by page); run it without `-lm none`.
 

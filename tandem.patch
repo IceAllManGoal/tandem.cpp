@@ -3157,7 +3157,7 @@ index 0000000..043e4e2
 +// Returns the number of nodes to skip after i, or 0 when the run does not match.
 +int ggml_cuda_hc_mix_fuse(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i);
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 33ad784..6316df4 100644
+index 33ad784..7e94418 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -1,4 +1,5 @@
@@ -3702,7 +3702,7 @@ index 33ad784..6316df4 100644
      const size_t  expert_size = src->nb[2];
  
      if (ids != st.ids || (int64_t) st.used.size() != n_expert) {
-@@ -2823,41 +3165,81 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
+@@ -2823,41 +3165,87 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
              }
          }
  
@@ -3759,7 +3759,13 @@ index 33ad784..6316df4 100644
 +            }
 +            // the pad alone when the last expert came from the arena with its pad, or from the device (as before)
 +            const size_t size = (b - run)*expert_size + (run < b || b == a || lctx->moe_cache->arena_expert(w, b - 1) == nullptr ? pad : 0);
-+            if (size > 0) {
++            if (size > 0 && run == b) {
++                // only the pad (the bytes after an expert copied from VRAM or the arena): zeros, not the mapping, which store
++                // mode drops: each such pad was a page fault read from the SSD (pcbox1 32 GB + 5090: ~10 s per prompt)
++                static const uint8_t zeros[4096] = {};
++                GGML_ASSERT(size <= sizeof(zeros));
++                ggml_backend_tensor_set_async(backend, dst, zeros, (run - e0)*expert_size, size);
++            } else if (size > 0) {
 +                ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + (run - e0)*expert_size, (run - e0)*expert_size, size);
 +            }
 +        };
@@ -3793,7 +3799,7 @@ index 33ad784..6316df4 100644
          }
  
          first = last + 1;
-@@ -3920,7 +4302,8 @@ void llama_context::opt_epoch_iter(
+@@ -3920,7 +4308,8 @@ void llama_context::opt_epoch_iter(
              ggml_opt_prepare_alloc(opt_ctx, ctx_compute_opt, gf, res->get_inp_tokens(), res->get_logits());
              ggml_opt_alloc(opt_ctx, train);
  
@@ -3803,7 +3809,7 @@ index 33ad784..6316df4 100644
              {
                  struct ggml_tensor * labels = ggml_opt_labels(opt_ctx);
                  GGML_ASSERT(labels->ne[1] == n_ubatch);
-@@ -4025,6 +4408,8 @@ llama_context_params llama_context_default_params() {
+@@ -4025,6 +4414,8 @@ llama_context_params llama_context_default_params() {
          /*.type_k                      =*/ GGML_TYPE_F16,
          /*.type_v                      =*/ GGML_TYPE_F16,
          /*.moe_cache_size              =*/ 0,
@@ -3812,7 +3818,7 @@ index 33ad784..6316df4 100644
          /*.abort_callback              =*/ nullptr,
          /*.abort_callback_data         =*/ nullptr,
          /*.embeddings                  =*/ false,
-@@ -4183,6 +4568,14 @@ uint32_t llama_n_rs_seq(const llama_context * ctx) {
+@@ -4183,6 +4574,14 @@ uint32_t llama_n_rs_seq(const llama_context * ctx) {
      return ctx->get_cparams().n_rs_seq;
  }
  
@@ -3827,7 +3833,7 @@ index 33ad784..6316df4 100644
  const llama_model * llama_get_model(const llama_context * ctx) {
      return &ctx->get_model();
  }
-@@ -4318,6 +4711,22 @@ bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler *
+@@ -4318,6 +4717,22 @@ bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler *
      return ctx->set_sampler(seq_id, smpl);
  }
  
@@ -5394,7 +5400,7 @@ index 222238e..03d8717 100644
      // helper: read the SWA pattern as one flag per layer, or as a period expanded by set_swa_pattern
      void load_swa_pattern(llama_model_loader & ml, uint32_t n_pattern, bool dense_first = false);
 diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
-index 6a343a7..9d8fb77 100644
+index 6a343a7..92ac91a 100644
 --- a/src/llama-moe-cache.cpp
 +++ b/src/llama-moe-cache.cpp
 @@ -1,37 +1,388 @@
@@ -5964,7 +5970,7 @@ index 6a343a7..9d8fb77 100644
          for (int32_t e : uniq) {
              if (slots[e] >= 0) {
                  touch(slots[e]);
-@@ -141,462 +537,5102 @@ struct moe_cache_slru {
+@@ -141,462 +537,5265 @@ struct moe_cache_slru {
              if (slots[e] >= 0) {
                  continue;
              }
@@ -7223,6 +7229,47 @@ index 6a343a7..9d8fb77 100644
 +
 +}
 +
++// the pinned RAM an auto-sized arena may take: MemAvailable, less the CMA region and a reserve (the server's prompt cache, host
++// compute buffers, the OS). Pinned (long-term) pages cannot live in CMA, but MemAvailable counts it: kernel 7.0 shows ~7% of RAM
++// there with CmaTotal 0 (pcbox1 128 GB: 9.0 GiB; a 120 GiB arena was OOM-killed with 9 GiB "free"). CmaFree changes as pinning
++// migrates pages out, so the region itself (the per-zone "cma" count of /proc/zoneinfo) is taken when larger.
++static size_t arena_auto_room(size_t & cma, size_t & rsv) {
++    cma = rsv = 0;
++#ifndef __linux__
++    return 0;
++#else
++    size_t avail = 0, cma_free = 0;
++    std::ifstream mi("/proc/meminfo");
++    for (std::string k; mi >> k; ) {
++        size_t v = 0;
++        std::string unit;
++        mi >> v >> unit;
++        if (k == "MemAvailable:") {
++            avail = v << 10;
++        } else if (k == "CmaFree:") {
++            cma_free = v << 10;
++        }
++    }
++    size_t cma_region = 0;
++    std::ifstream zi("/proc/zoneinfo");
++    for (std::string k; zi >> k; ) {
++        if (k == "cma") {
++            size_t n = 0;
++            if (zi >> n) {
++                cma_region += n * (size_t) sysconf(_SC_PAGESIZE);
++            } else {
++                zi.clear();
++            }
++        }
++    }
++    cma = std::max(cma_free, cma_region);
++    avail = avail > cma ? avail - cma : 0;
++    rsv = getenv("LLAMA_MOE_ARENA_RESERVE_MIB") ? (size_t) atoll(getenv("LLAMA_MOE_ARENA_RESERVE_MIB")) << 20
++                                                : ((size_t) 2 << 30) + llama_moe_ram_limit()/64;
++    return avail > rsv ? avail - rsv : 0;
++#endif
++}
++
 +struct llama_moe_cache::impl {
 +    // a GPU with its own budget and banks, it caches the layers assigned to it
 +    struct device {
@@ -7792,6 +7839,126 @@ index 6a343a7..9d8fb77 100644
 +            n, bytes/1073741824.0, (ggml_time_us() - t0)/1e6, path);
 +    }
 +
++    // store mode, at start (LLAMA_MOE_ARENA_FILL=0: off): when the VRAM cache and the arena together hold every expert, each
++    // group's empty VRAM slots take an even share of its layers' experts and the arena reads the rest (Strata reads the
++    // complement of its GPU cache into RAM at load). Exclusive mode keeps it that way (a VRAM victim goes back to the arena,
++    // an upload frees its arena slot): decode and prompts read nothing from the SSD. pcbox1 32 GB + RTX 5090, Qwen3.8 IQ3_S:
++    // filling by misses read 93 GB in a 16-question run. Returns false when the experts do not fit (nothing is placed).
++    bool fill_complement() {
++        if (!arena_store || !arena || arena->base == nullptr || (getenv("LLAMA_MOE_ARENA_FILL") && atoi(getenv("LLAMA_MOE_ARENA_FILL")) == 0)) {
++            return false;
++        }
++        const int64_t t0 = ggml_time_us();
++        const size_t n_pool = arena->pool_size.size();
++        std::vector<int64_t> pool_free(n_pool, 0), pool_need(n_pool, 0);
++        for (int32_t v = 0; v < arena->n_slots; ++v) {
++            pool_free[arena->pool_of_slot[v]] += arena->key_of[v] < 0;
++        }
++        for (int64_t & f : pool_free) {
++            f -= std::max<int64_t>(16, f/100);      // slack: VRAM victims copied back, the slots of the protected calls
++        }
++        std::vector<std::vector<int32_t>> to_vram(layers.size()), to_arena(layers.size());
++        size_t n_all = 0, n_vram = 0;
++        for (const group & g : groups) {
++            int32_t n_free = 0;
++            for (int32_t v = 0; v < g.n_slots; ++v) {
++                n_free += g.lru.key_of[v] < 0;
++            }
++            const int32_t nl = (int32_t) g.layers.size();
++            for (int32_t k = 0; k < nl; ++k) {
++                const int32_t il = g.layers[k];
++                const int32_t * map = g.lru.slot_map[il];
++                if (map == nullptr) {
++                    continue;
++                }
++                int32_t q = n_free/nl + (k < n_free % nl);
++                const int32_t ne = (int32_t) layers[il].slot_map->ne[1];
++                const int32_t ip = arena->pool_of[il];
++                for (int32_t e = 0; e < ne; ++e) {
++                    n_all++;
++                    if (map[e] >= 0) {
++                        n_vram++;
++                    } else if (q > 0) {
++                        to_vram[il].push_back(e);
++                        q--;
++                    } else if (ip >= 0 && arena->slot_of[il][e] < 0) {
++                        to_arena[il].push_back(e);
++                        pool_need[ip]++;
++                    } else if (ip < 0) {
++                        return false;               // a layer the arena does not hold
++                    }
++                }
++            }
++        }
++        for (size_t ip = 0; ip < n_pool; ++ip) {
++            if (pool_need[ip] > pool_free[ip]) {
++                LLAMA_LOG_INFO("llama_moe_cache: arena fill: the experts do not fit (pool %zu: %lld more needed, %lld free); filled by misses\n",
++                    ip, (long long) pool_need[ip], (long long) pool_free[ip]);
++                return false;
++            }
++        }
++        // the VRAM share is staged through the arena's (pinned) slots, a layer at a time: O_DIRECT reads at the drive's rate and
++        // DMA uploads (through the mapping: ~1.1 GB/s of page faults on pcbox1); the slots are released after the uploads
++        auto wait_reads = [&] {
++            while (arena->done.load(std::memory_order_acquire) < arena->jobs.size()) {
++                std::this_thread::sleep_for(std::chrono::microseconds(200));
++            }
++        };
++        size_t nv = 0, bv = 0;
++        for (group & g : groups) {
++            for (int32_t il : g.layers) {
++                int32_t * map = g.lru.slot_map[il];
++                const layer & l = layers[il];
++                if (!to_vram[il].empty()) {
++                    arena->ensure(il, to_vram[il].data(), to_vram[il].size());
++                    wait_reads();
++                }
++                for (int32_t e : to_vram[il]) {
++                    const int32_t v = g.lru.head;
++                    if (map == nullptr || v < 0 || g.lru.key_of[v] >= 0) {
++                        break;
++                    }
++                    for (size_t ip = 0; ip < l.experts.size(); ++ip) {
++                        const size_t nb2 = l.experts[ip]->nb[2];
++                        const uint8_t * src = arena->get_ready(il, (int32_t) ip, e);
++                        ggml_backend_tensor_set(g.banks[ip], src ? src : (const uint8_t *) l.experts[ip]->data + (size_t) e*nb2, (size_t) v*nb2, nb2);
++                        bv += nb2;
++                    }
++                    arena->release(il, e);
++                    g.lru.key_of[v] = il*g.lru.n_expert + e;
++                    map[e] = v;
++                    g.lru.touch(v);
++                    nv++;
++                }
++            }
++        }
++        const double t1 = (ggml_time_us() - t0)/1e6;
++        const double b0 = arena->bytes;
++        size_t na = 0;
++        for (size_t il = 0; il < layers.size(); ++il) {
++            if (!to_arena[il].empty()) {
++                arena->ensure((int32_t) il, to_arena[il].data(), to_arena[il].size());
++                na += to_arena[il].size();
++            }
++        }
++        wait_reads();
++        const double t2 = (ggml_time_us() - t0)/1e6;
++        LLAMA_LOG_INFO("llama_moe_cache: arena fill: all %zu experts held: %zu in VRAM before, %zu placed in VRAM (%.1f GiB, %.1f s), %zu read into the arena (%.1f GiB, %.1f s); nothing left on the SSD\n",
++            n_all, n_vram, nv, bv/1073741824.0, t1, na, (arena->bytes - b0)/1073741824.0, t2 - t1);
++        arena->n_reads = arena->n_hits = arena->n_calls = 0;
++        arena->bytes = arena->t_us = 0.0;
++        if (hybrid_auto) {
++            // every miss is in pinned RAM, as with LLAMA_MOE_PIN_EXPS, where the gate settles on GPU-only: upload every miss
++            // (LLAMA_MOE_CPU=1). Not the gate's off state: graphs without the CPU path take the plain upload path, which
++            // does not copy VRAM victims back (exclusive mode), so they fell back to the SSD and the gate saw GPU-only lose
++            // (pcbox1 32 GB + 5090: LLAMA_MOE_CPU=1 143 / 145 tok/s, auto 104, gate starting off 50-56)
++            hybrid_auto  = false;
++            hybrid_share = 1.0;
++            LLAMA_LOG_INFO("llama_moe_cache: arena fill: every miss is uploaded from pinned RAM (as LLAMA_MOE_CPU=1)\n");
++        }
++        return true;
++    }
++
 +    void warm_hot(const char * path, bool sync) {
 +        std::ifstream f(path);
 +        std::vector<std::pair<int32_t, int32_t>> list;
@@ -8157,7 +8324,14 @@ index 6a343a7..9d8fb77 100644
 +            const double spill = host > size ? (double) (host - size) : 0.0;
 +            const size_t ram   = llama_moe_ram_limit();
 +            fault_auto = ram > 0 && spill > 0.5*ram;
-+            store_auto = ram > 0 && spill > 0.85*ram && !getenv("LLAMA_MOE_ARENA_MIB") &&
++            // store mode also when VRAM + RAM may hold every expert but the page cache cannot (all host experts over 85% of
++            // the RAM: it would keep copies of the VRAM-cached ones too); fill_complement then places all of them at start
++            // (pcbox1 32 GB + RTX 5090, Qwen3.8 IQ3_S: 24 GB not in VRAM of 30.7 GiB RAM was below the spill rule)
++            // not when only part fits: pcbox1 128 GB + RTX 5090, DS4.1 IQ2_XS (114.6 GiB not in VRAM, arena 110 GiB) store
++            // 30.2 / 30.0 tok/s vs mmap 33.1 / 32.0; experts over the RAM (DS4.1 64 GB, Qwen3.8 32 GB + 16 GB card): store wins
++            size_t cma_s = 0, rsv_s = 0;
++            const bool fits = (double) host > 0.85*ram && spill <= 0.97*(double) arena_auto_room(cma_s, rsv_s);
++            store_auto = ram > 0 && (spill > ram || fits) && !getenv("LLAMA_MOE_ARENA_MIB") &&
 +                (!getenv("LLAMA_MOE_STORE_AUTO") || atoi(getenv("LLAMA_MOE_STORE_AUTO")) != 0);
 +            if (fault_auto && !getenv("LLAMA_MOE_FAULT_PRED") && spill > ram) {
 +                fault_pred      = 1;
@@ -8498,7 +8672,7 @@ index 6a343a7..9d8fb77 100644
 +            const bool am_auto = am && strcmp(am, "auto") == 0;
 +            const bool am_on   = am && (atoll(am) > 0 || am_auto);
 +            if (store_auto && am_on && hybrid && flag_mode && !doorbell && !la_backend) {
-+                LLAMA_LOG_INFO("%s: store mode: the experts do not fit in the RAM beside the VRAM cache; the arena holds their RAM copy (LLAMA_MOE_STORE_AUTO=0: off)\n", __func__);
++                LLAMA_LOG_INFO("%s: store mode: the experts do not fit in the page cache beside the VRAM cache; the arena holds their RAM copy (LLAMA_MOE_STORE_AUTO=0: off)\n", __func__);
 +            }
 +            fault_auto = fault_auto && !am_on && !la_backend;
 +            const int n_ft = ft ? atoi(ft) : fault_auto ? 16 : 0;
@@ -8531,23 +8705,12 @@ index 6a343a7..9d8fb77 100644
 +                        // the RAM the kernel could give after dropping the experts' pages, less a reserve (the server's prompt
 +                        // cache, host compute buffers, the OS); never more than all the experts
 +                        const size_t n_drop = arena->drop_page_cache();
-+                        size_t avail = 0;
-+                        std::ifstream mi("/proc/meminfo");
-+                        for (std::string k; mi >> k; ) {
-+                            size_t v = 0;
-+                            std::string unit;
-+                            mi >> v >> unit;
-+                            if (k == "MemAvailable:") {
-+                                avail = v << 10;
-+                                break;
-+                            }
-+                        }
-+                        const size_t rsv = getenv("LLAMA_MOE_ARENA_RESERVE_MIB") ? (size_t) atoll(getenv("LLAMA_MOE_ARENA_RESERVE_MIB")) << 20
-+                                                                                : (size_t) 2 << 30;
++                        size_t cma = 0, rsv = 0;
++                        const size_t room = arena_auto_room(cma, rsv);
 +                        const size_t all = arena->all_bytes();
-+                        size = std::min(all, avail > rsv ? avail - rsv : 0);
-+                        LLAMA_LOG_INFO("%s: arena auto: %.1f GiB of expert pages dropped from the page cache, %.1f GiB available, reserve %.1f GiB, all experts %.1f GiB\n",
-+                            __func__, n_drop/1073741824.0, avail/1073741824.0, rsv/1073741824.0, all/1073741824.0);
++                        size = std::min(all, room);
++                        LLAMA_LOG_INFO("%s: arena auto: %.1f GiB of expert pages dropped from the page cache, %.1f GiB available (CMA %.1f GiB not counted), reserve %.1f GiB, all experts %.1f GiB\n",
++                            __func__, n_drop/1073741824.0, (room + rsv)/1073741824.0, cma/1073741824.0, rsv/1073741824.0, all/1073741824.0);
 +                    }
 +                    const int64_t t0 = ggml_time_us();
 +                    arena_buf.reset(ggml_backend_buft_alloc_buffer(buft_host, size + moe_arena::align));
@@ -8650,6 +8813,7 @@ index 6a343a7..9d8fb77 100644
 +                }
 +            }
 +            if (arena_store) {
++                fill_complement();
 +                arena->drop_page_cache();
 +            }
 +        }
@@ -9136,9 +9300,14 @@ index 6a343a7..9d8fb77 100644
 +            for (int rep = 0; rep < 4; ++rep) {
 +                const int64_t t0 = ggml_time_us();
 +                size_t bytes = 0;
++                // store mode: the uploads read the arena (pinned), not the mapping (pageable after the page cache drop:
++                // pcbox1 32 GB + 5090 probed 17 GB/s vs 42.6 from pinned memory, and the rule gave the CPU 75% of the misses)
++                const uint8_t * src_arena = arena_store && arena && arena->base ? arena->base : nullptr;
++                size_t off_arena = 0;
 +                for (size_t ip = 0; ip < l.experts.size(); ++ip) {
 +                    const ggml_tensor * w = l.experts[ip];
-+                    ggml_backend_tensor_set_async(be, g.banks[ip], w->data, 0, 8*w->nb[2]);
++                    ggml_backend_tensor_set_async(be, g.banks[ip], src_arena ? src_arena + off_arena : (const uint8_t *) w->data, 0, 8*w->nb[2]);
++                    off_arena += 8*w->nb[2];
 +                    bytes += 8*w->nb[2];
 +                }
 +                ggml_backend_synchronize(be);
@@ -11421,7 +11590,7 @@ index 6a343a7..9d8fb77 100644
      }
  
      void log_stats() const {
-@@ -610,14 +5646,150 @@ struct llama_moe_cache::impl {
+@@ -610,14 +5809,150 @@ struct llama_moe_cache::impl {
          };
          log("ubatch <= 8", stats_small);
          log("ubatch  > 8", stats_large);
@@ -11574,7 +11743,7 @@ index 6a343a7..9d8fb77 100644
  }
  
  llama_moe_cache::~llama_moe_cache() = default;
-@@ -635,11 +5807,151 @@ ggml_tensor * llama_moe_cache::get_experts(const ggml_tensor * w) const {
+@@ -635,11 +5970,151 @@ ggml_tensor * llama_moe_cache::get_experts(const ggml_tensor * w) const {
  }
  
  bool llama_moe_cache::copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
@@ -11729,7 +11898,7 @@ index 6a343a7..9d8fb77 100644
  }
  
  std::map<ggml_backend_buffer_type_t, size_t> llama_moe_cache::memory_breakdown() const {
-@@ -654,3 +5966,133 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_moe_cache::memory_breakdown()
+@@ -654,3 +6129,133 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_moe_cache::memory_breakdown()
      }
      return res;
  }
