@@ -23,6 +23,10 @@ We tuned for Qwen3.8 only, but other MoE models that do not fit in VRAM gain too
 
 For a big card serving many concurrent streams, use [Tandem-vLLM](https://github.com/ewhacc/tandem) instead; tandem.cpp is for one user on a 16–32 GB card with the experts in RAM.
 
+> **Known issue (2026-11-15): 128 GB RAM with a model bigger than RAM (e.g. DeepSeek-V4.1).** The RAM store sizes itself
+> too close to all of RAM, and the server is killed at load or the PC stops responding. Until the fix, start the server
+> with `LLAMA_MOE_STORE_AUTO=0` (this is how the 33.1 tok/s DeepSeek-V4.1 row was measured). Our 32 and 64 GB test PCs were not affected.
+
 ## What's new (2026-11-15)
 
 - **Faster GPU work between the routing steps, on NVIDIA and AMD.** Three kernel changes in the shared CUDA/HIP code: the
@@ -366,6 +370,7 @@ With the defaults off the patch computes exactly what llama.cpp does; the defaul
 - Linux only. Tuned and tested on NVIDIA (CUDA). AMD (ROCm) works and gets the shared kernel work, but it has had less tuning and was tested on one RX 7900 XTX ([above](#amd-gpus-rocm)).
 - Qwen3.8 GGUFs converted with a current llama.cpp may be a little slower than the ISTA files we measured (one fusion does not apply to their layout).
 - Known issues, to be fixed:
+  - 128 GB RAM with a model bigger than RAM: killed at load or the PC hangs; set `LLAMA_MOE_STORE_AUTO=0` ([above](#whats-new-2026-11-15));
   - models much larger than RAM (read from the SSD) depend on the drive (see the gaming-PC rows for a PCIe 4.0 drive);
   - DeepSeek-V4.1 with `-lm none` loads very slowly (its 103 GiB Engram tables are copied page by page); run it without `-lm none`.
 
