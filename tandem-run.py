@@ -6,15 +6,42 @@
     python3 tandem-run.py --model qwen3.8 --dry-run  # print the plan only
 
 Steps: detect hardware -> resolve model -> choose flags (each with a reason) -> calibrate once per
-machine+model (cached in ~/.cache/tandem/) -> launch llama-server in the foreground.
-Stdlib only. Linux + NVIDIA for now; hardware access sits behind detect_*() and Backend so others can be added.
+machine+model (cached in ~/.cache/tandem/, in %LOCALAPPDATA%\\tandem on Windows) -> launch llama-server in the
+foreground.
+Stdlib only. Linux and Windows, NVIDIA (CUDA); hardware access sits behind detect_*() and the platform
+helpers, so other platforms can be added the same way.
 """
-import argparse, glob, hashlib, json, os, re, shlex, shutil, signal, struct, subprocess, sys, time
+import argparse, glob, hashlib, json, os, platform, re, shlex, shutil, signal, struct, subprocess, sys, time
 import urllib.request
 
 GiB = 1024 ** 3
 MiB = 1024 ** 2
-CACHE_DIR = os.path.expanduser(os.environ.get("TANDEM_CACHE_DIR", "~/.cache/tandem"))
+IS_WIN = os.name == "nt"
+
+
+def default_cache_dir():
+    """Calibration cache: %LOCALAPPDATA%\\tandem on Windows, ~/.cache/tandem elsewhere."""
+    if IS_WIN:
+        return os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "tandem")
+    return "~/.cache/tandem"
+
+
+def default_server_bin():
+    """llama-server from TANDEM_SERVER, from PATH, else the path build.sh / build.ps1 produce."""
+    if os.environ.get("TANDEM_SERVER"):
+        return os.environ["TANDEM_SERVER"]
+    found = shutil.which("llama-server")
+    if found:
+        return found
+    cands = (["tandem/build/bin/Release/llama-server.exe", "tandem/build/bin/llama-server.exe"]
+             if IS_WIN else ["tandem/build/bin/llama-server"])
+    for cand in cands:
+        if os.path.exists(cand):
+            return cand
+    return cands[0]
+
+
+CACHE_DIR = os.path.expanduser(os.environ.get("TANDEM_CACHE_DIR", default_cache_dir()))
 
 # ----------------------------------------------------------------------------------------------
 # Registry. "kind" selects the rule set in choose_flags(). Sizes are bytes of the files as published.
@@ -55,6 +82,160 @@ def say(msg=""):
 
 
 # ----------------------------------------------------------------------------------------------
+# Shell quoting and flag splitting: the printed command has to be usable in the host's shell
+# ----------------------------------------------------------------------------------------------
+def shq(s):
+    """One argument, quoted for this platform's shell."""
+    return subprocess.list2cmdline([s]) if IS_WIN else shlex.quote(s)
+
+
+def join_cmd(argv):
+    """A whole command line: Windows command-line rules on Windows, POSIX quoting elsewhere."""
+    return subprocess.list2cmdline(list(argv)) if IS_WIN else " ".join(shlex.quote(a) for a in argv)
+
+
+def env_prefix(env):
+    """'K=V ' for POSIX shells, '$env:K="V"; ' for PowerShell."""
+    if IS_WIN:
+        return "".join(f'$env:{k}="{v}"; ' for k, v in sorted(env.items()))
+    return "".join(f"{k}={shlex.quote(v)} " for k, v in sorted(env.items()))
+
+
+def split_flags(s, win=None):
+    """Split a flag string the way the platform's shell would: shlex.split on POSIX; on Windows backslashes are
+    path separators, so the command line is split with posix=False and the quotes are stripped off."""
+    if not s:
+        return []
+    windows = IS_WIN if win is None else win
+    if windows:
+        out = []
+        for tok in shlex.split(s, posix=False):
+            if len(tok) >= 2 and tok[0] == tok[-1] and tok[0] in "\"'":
+                tok = tok[1:-1]
+            out.append(tok)
+        return out
+    return shlex.split(s)
+
+
+# ----------------------------------------------------------------------------------------------
+# Platform helpers: memory, physical cores and the OS label of the host
+# ----------------------------------------------------------------------------------------------
+def _win_kernel32():
+    import ctypes
+    return ctypes.WinDLL("kernel32", use_last_error=True)
+
+
+def _win_affinity_mask():
+    """Affinity mask of this process (processor group 0), 0 when it cannot be read."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k32 = _win_kernel32()
+        # both prototypes are needed: the pseudo-handle of GetCurrentProcess is -1, which ctypes would otherwise
+        # pass as a C int and reject as too long
+        k32.GetCurrentProcess.restype = wintypes.HANDLE
+        k32.GetProcessAffinityMask.argtypes = [wintypes.HANDLE, ctypes.POINTER(ctypes.c_size_t),
+                                               ctypes.POINTER(ctypes.c_size_t)]
+        k32.GetProcessAffinityMask.restype = wintypes.BOOL
+        proc, sysmask = ctypes.c_size_t(0), ctypes.c_size_t(0)
+        if not k32.GetProcessAffinityMask(k32.GetCurrentProcess(), ctypes.byref(proc), ctypes.byref(sysmask)):
+            return 0
+        return proc.value
+    except (OSError, AttributeError):
+        return 0
+
+
+def detect_cores_windows():
+    """Physical cores (SMT siblings count once) among the CPUs in this process's affinity mask."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k32 = _win_kernel32()
+        k32.GetLogicalProcessorInformationEx.argtypes = [wintypes.DWORD, ctypes.c_void_p,
+                                                         ctypes.POINTER(wintypes.DWORD)]
+        k32.GetLogicalProcessorInformationEx.restype = wintypes.BOOL
+        rel_processor_core = 0
+        need = wintypes.DWORD(0)
+        k32.GetLogicalProcessorInformationEx(rel_processor_core, None, ctypes.byref(need))
+        if need.value == 0:
+            return 0
+        buf = ctypes.create_string_buffer(need.value)
+        if not k32.GetLogicalProcessorInformationEx(rel_processor_core, buf, ctypes.byref(need)):
+            return 0
+        data, mask, n, off = buf.raw[:need.value], _win_affinity_mask(), 0, 0
+        while off + 8 <= len(data):
+            rel  = int.from_bytes(data[off:off + 4], "little")
+            size = int.from_bytes(data[off + 4:off + 8], "little")
+            if size < 8 or off + size > len(data):
+                break
+            if rel == rel_processor_core:
+                # PROCESSOR_RELATIONSHIP: Flags, EfficiencyClass, Reserved[20], GroupCount, GroupMask[]
+                body = data[off + 8:off + size]
+                groups = int.from_bytes(body[22:24], "little") if len(body) >= 24 else 0
+                hit = mask == 0 or groups == 0
+                for grp in range(max(1, groups)):
+                    start = 32 + 16*grp      # GROUP_AFFINITY: Mask (8), Group (2), Reserved (6), 8-byte aligned
+                    if start + 8 > len(body):
+                        break
+                    # only group 0 is comparable with the mask GetProcessAffinityMask returns
+                    if grp > 0 or (int.from_bytes(body[start:start + 8], "little") & mask):
+                        hit = True
+                n += 1 if hit else 0
+            off += size
+        return n
+    except (OSError, AttributeError):
+        return 0
+
+
+def detect_ram_windows():
+    """(physical RAM, commit limit, effective bytes) from GlobalMemoryStatusEx; zeros when unavailable.
+
+    Pinned experts and CUDA host buffers are charged to the commit limit (RAM + pagefile), so the lower of the
+    two is what the plan may fill."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [("dwLength", wintypes.DWORD), ("dwMemoryLoad", wintypes.DWORD),
+                        ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+        st = MEMORYSTATUSEX()
+        st.dwLength = ctypes.sizeof(st)
+        if not _win_kernel32().GlobalMemoryStatusEx(ctypes.byref(st)):
+            return 0, 0, 0
+        total  = int(st.ullTotalPhys)
+        commit = int(st.ullTotalPageFile)
+        return total, commit, (min(total, commit) if commit else total)
+    except (OSError, AttributeError):
+        return 0, 0, 0
+
+
+def cpu_name_windows():
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                            r"HARDWARE\DESCRIPTION\System\CentralProcessor\0") as k:
+            return str(winreg.QueryValueEx(k, "ProcessorNameString")[0]).strip()
+    except (OSError, ImportError):
+        return "?"
+
+
+def os_label():
+    """'6.8.0-45-generic' on Linux, 'Windows 11 (10.0.22631)' on Windows."""
+    if IS_WIN:
+        version = platform.version()
+        parts = version.split(".")
+        build = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+        name = "11" if build >= 22000 else ("10" if build >= 10240 else "?")
+        return f"Windows {name} ({version})"
+    return os.uname().release
+
+
+# ----------------------------------------------------------------------------------------------
 # Hardware
 # ----------------------------------------------------------------------------------------------
 class HW(dict):
@@ -84,7 +265,11 @@ def detect_gpus():
 
 
 def detect_cores():
-    """Physical cores: unique (physical id, core id) pairs in /proc/cpuinfo, honouring the affinity mask."""
+    """Physical cores honouring the affinity mask: unique (physical id, core id) pairs in /proc/cpuinfo on Linux,
+    GetLogicalProcessorInformationEx on Windows."""
+    if IS_WIN:
+        n = detect_cores_windows()
+        return max(1, n or (os.cpu_count() or 2) // 2), cpu_name_windows()
     try:
         allowed = os.sched_getaffinity(0)
     except AttributeError:
@@ -136,6 +321,10 @@ def cgroup_mem_limit():
 
 
 def detect_ram():
+    """(total, limit, effective bytes): MemTotal and the cgroup limit on Linux, physical RAM and the commit limit
+    on Windows (pinned memory is charged to the commit limit)."""
+    if IS_WIN:
+        return detect_ram_windows()
     total = 0
     try:
         total = next(int(l.split()[1]) * 1024 for l in open("/proc/meminfo") if l.startswith("MemTotal"))
@@ -161,7 +350,7 @@ def detect(args, probe_dir):
         hw["disk_free_gib"] = shutil.disk_usage(probe_dir).free / GiB
     except OSError:
         hw["disk_free_gib"] = None
-    hw["kernel"] = os.uname().release
+    hw["kernel"] = os_label()
     hw["real"] = {k: hw[k] for k in ("vram_gib", "ram_gib", "cores")}
     hw["emulated"] = []
     # test overrides: emulate a smaller box on a bigger one (the wrappers are added in build_command)
@@ -331,7 +520,7 @@ def offer_downloads(m, hw, args):
     tot = sum(x[3] for x in m.missing)
     say("Missing files:")
     for what, repo, inc, gib in m.missing:
-        say(f"  {what}: hf download {repo} --include '{inc}' --local-dir {models_dir(args)}   (~{gib:g} GiB)")
+        say(f"  {what}: hf download {repo} --include '{inc}' --local-dir {shq(models_dir(args))}   (~{gib:g} GiB)")
     free = hw.disk_free_gib
     if free is not None and free < tot + 2:
         sys.exit(f"tandem-run: need ~{tot:g} GiB but only {free:.0f} GiB is free in {models_dir(args)}. "
@@ -375,9 +564,9 @@ class Plan:
         self.draft_candidates = []
 
     def add(self, flags, why):
-        flags = shlex.split(flags) if isinstance(flags, str) else flags
+        flags = split_flags(flags) if isinstance(flags, str) else flags
         self.args += flags
-        self.reasons.append((" ".join(shlex.quote(x) for x in flags), why))
+        self.reasons.append((join_cmd(flags), why))
 
     def set_env(self, k, v, why):
         self.env[k] = v
@@ -430,7 +619,7 @@ def choose_flags(hw, m, args, calib=None):
     elif ram < size_gib + 8:
         p.notes.append("the model is larger than RAM: experts are read from the SSD, speed depends on the SSD; "
                        "the first requests are slower while the cache warms")
-    kv = re.match(r"(\d+)\.(\d+)", hw.kernel or "")
+    kv = None if IS_WIN else re.match(r"(\d+)\.(\d+)", hw.kernel or "")
     if ram < size_gib + 8 and kv and (int(kv[1]), int(kv[2])) < (6, 1):
         p.notes.append("older kernels reclaim mapped model pages poorly; expect slow loads below model size + 8 GiB of RAM")
     if ram < size_gib + 8 and build == "old":
@@ -482,13 +671,16 @@ def choose_flags(hw, m, args, calib=None):
     if "cores" in hw.emulated and cores < hw.real["cores"]:
         p.set_env("LLAMA_MOE_CPU_THREADS", str(max(1, cores - 1)), f"emulating {cores} cores: server default is cores-1")
         p.add(f"-t {cores} -tb {cores}", f"emulating {cores} cores: the server sizes its thread pool from the machine's cores, not the affinity mask (oversubscribed spinning threads are pathologically slow)")
+    if IS_WIN and hw.emulated:
+        p.warnings.append("emulated limits are advisory on Windows: neither the RAM cap (cgroup) nor the CPU affinity "
+                          "of the emulated machine can be applied, the rules are computed for it only")
 
     if args.fast:
         p.set_env("LLAMA_MOE_TAIL_SKIP", "7",
                   "APPROXIMATE (--fast): skips low-ranked missed experts; quality number: TODO(main session)")
     p.add(["--port", str(args.port), "--host", args.host], "listen address")
     if args.extra:
-        p.add(shlex.split(args.extra), "--extra")
+        p.add(split_flags(args.extra), "--extra")
     return p
 
 
@@ -503,9 +695,10 @@ def build_command(hw, args, plan):
     env["CUDA_VISIBLE_DEVICES"] = str(hw.gpu_index)
     argv = [args.server_bin, *plan.args]
     wrap = []
-    if "ram" in hw.emulated and hw.ram_gib < hw.real["ram_gib"] and not args.no_ram_cap:
+    # the wrappers that enforce emulated limits are Linux tools; on Windows the limits stay advisory
+    if "ram" in hw.emulated and hw.ram_gib < hw.real["ram_gib"] and not args.no_ram_cap and not IS_WIN:
         wrap += ["systemd-run", "--user", "--scope", "--quiet", "-p", f"MemoryMax={int(hw.ram_gib)}G"]  # no MemorySwapMax=0: a load-time anonymous peak gets OOM-killed without swap; real PCs have swap
-    if "cores" in hw.emulated and hw.cores < hw.real["cores"]:
+    if "cores" in hw.emulated and hw.cores < hw.real["cores"] and not IS_WIN:
         # physical cores 0..n-1 map to hardware threads 0..n-1 and n_total/2+... on SMT boxes; take both siblings
         wrap += ["taskset", "-c", f"0-{hw.cores - 1}"]   # amd numbering: cpus 0..15 are distinct physical cores
     return wrap + argv, env
@@ -513,13 +706,15 @@ def build_command(hw, args, plan):
 
 def print_plan(hw, m, plan, argv, env, calib_state):
     say("== Hardware ==")
-    ram = f"{hw.ram_gib:.0f} GiB" + (f" (cgroup limit; MemTotal {hw.ram_total_gib:.0f})" if hw.ram_cgroup_gib and hw.ram_cgroup_gib < hw.ram_total_gib else "")
+    lim = (f" ({'commit' if IS_WIN else 'cgroup'} limit; {'RAM' if IS_WIN else 'MemTotal'} {hw.ram_total_gib:.0f})"
+           if hw.ram_cgroup_gib and hw.ram_cgroup_gib < hw.ram_total_gib else "")
+    ram = f"{hw.ram_gib:.0f} GiB" + lim
     say(f"  GPU    {hw.gpu} #{hw.gpu_index}, {hw.vram_gib:.0f} GiB, sm_{hw.cc.replace('.', '')}, PCIe gen{hw.pcie_gen} x{hw.pcie_width}"
         f"{'  [emulated VRAM; real %.0f GiB]' % hw.real['vram_gib'] if 'vram' in hw.emulated else ''}")
     say(f"  CPU    {hw.cores} physical cores ({hw.cpu}){'  [emulated]' if 'cores' in hw.emulated else ''}")
     say(f"  RAM    {ram}{'  [emulated]' if 'ram' in hw.emulated else ''}")
     say(f"  disk   {hw.disk_free_gib:.0f} GiB free" if hw.disk_free_gib is not None else "  disk   ?")
-    say(f"  kernel {hw.kernel}")
+    say(f"  {'OS' if IS_WIN else 'kernel':<6} {hw.kernel}")
     say("== Model ==")
     say(f"  {m.entry['title'] if m.entry else 'generic MoE rules (not in the registry)'}")
     say(f"  {m.path}  ({m.size / GiB:.1f} GiB{'' if os.path.exists(m.path) else ', not downloaded'})")
@@ -535,9 +730,9 @@ def print_plan(hw, m, plan, argv, env, calib_state):
         say(f"  WARNING: {w}")
     say(f"== Calibration: {calib_state} ==")
     say("== Command ==")
-    envs = " ".join(f"{k}={shlex.quote(v)}" for k, v in sorted(env.items())
-                    if k in plan.env or k in ("CUDA_VISIBLE_DEVICES", "CUDA_DEVICE_ORDER"))
-    say("  " + envs + " " + " ".join(shlex.quote(a) for a in argv))
+    envs = env_prefix({k: v for k, v in env.items()
+                       if k in plan.env or k in ("CUDA_VISIBLE_DEVICES", "CUDA_DEVICE_ORDER")})
+    say("  " + envs + join_cmd(argv))
 
 
 # ----------------------------------------------------------------------------------------------
@@ -613,18 +808,56 @@ def wait_ready(proc, port, timeout=1800):
     return False
 
 
-def stop_group(proc):
+def spawn_kwargs():
+    """Start the server in its own process group, so it can be stopped without touching this process.
+    POSIX: setsid(); Windows: a new process group, which CTRL_BREAK_EVENT can address."""
+    flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    if IS_WIN and flags:
+        return {"creationflags": flags}
+    return {"start_new_session": not IS_WIN}
+
+
+def stop_group(proc, timeout=60):
+    """Stop the server (and whatever it spawned). There is no os.killpg on Windows: a console break goes to the
+    process group and, if that does not stop it, taskkill /T /F kills the tree."""
+    if proc.poll() is not None:
+        return
+    if IS_WIN:
+        ctrl_break = getattr(signal, "CTRL_BREAK_EVENT", None)
+        if ctrl_break is not None:
+            try:
+                os.kill(proc.pid, ctrl_break)
+            except (OSError, ValueError):
+                pass
+        try:
+            proc.wait(min(timeout, 30))
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except (OSError, subprocess.SubprocessError):
+            pass
+        try:
+            proc.wait(15)
+        except subprocess.TimeoutExpired:
+            pass
+        return
     try:
         os.killpg(proc.pid, signal.SIGTERM)
-        proc.wait(60)
+        proc.wait(timeout)
     except (ProcessLookupError, PermissionError):
         pass
     except subprocess.TimeoutExpired:
-        os.killpg(proc.pid, signal.SIGKILL)
+        try:
+            os.killpg(proc.pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+        except (ProcessLookupError, PermissionError):
+            pass
 
 
 def start_server(argv, env, log_path):
-    return subprocess.Popen(argv, env=env, stdout=open(log_path, "w"), stderr=subprocess.STDOUT, start_new_session=True)
+    return subprocess.Popen(argv, env=env, stdout=open(log_path, "w"), stderr=subprocess.STDOUT, **spawn_kwargs())
 
 
 def calibrate(hw, m, args, plan, env_argv_fn):
@@ -687,7 +920,7 @@ def parse_args(argv=None):
     ap.add_argument("--draft", help="draft/MTP/EAGLE3 file (overrides the registry's)")
     ap.add_argument("--no-draft", action="store_true", help="no speculative decoding")
     ap.add_argument("--models-dir", default="~/tandem-models", help="where downloads go and registry files are looked up")
-    ap.add_argument("--server-bin", default=os.environ.get("TANDEM_SERVER") or shutil.which("llama-server") or "./tandem/build/bin/llama-server")
+    ap.add_argument("--server-bin", default=default_server_bin())
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--ctx", type=int, default=None, help="total context (default 16384)")
@@ -699,10 +932,12 @@ def parse_args(argv=None):
     ap.add_argument("--calib-budget-s", type=int, default=420, help="stop trying extra candidates after this many seconds")
     ap.add_argument("--dry-run", action="store_true", help="print the plan; start nothing, download nothing")
     ap.add_argument("--yes", action="store_true", help="accept downloads without asking")
-    ap.add_argument("--extra", default="", help="extra llama-server flags (shlex-split), appended last")
+    ap.add_argument("--extra", default="",
+                    help="extra llama-server flags, appended last (split with POSIX shell rules on Linux, "
+                         "Windows command-line rules on Windows)")
     ap.add_argument("--assume-vram-gib", type=float)
-    ap.add_argument("--assume-ram-gib", type=float)
-    ap.add_argument("--assume-cores", type=int)
+    ap.add_argument("--assume-ram-gib", type=float, help="compute the rules for this RAM; the cap is advisory on Windows")
+    ap.add_argument("--assume-cores", type=int, help="compute the rules for this many cores; the affinity is advisory on Windows")
     ap.add_argument("--no-ram-cap", action="store_true", help=argparse.SUPPRESS)   # bench: assume RAM for the rules, but no cgroup cap
     ap.add_argument("--fake-build", choices=["new", "old", "unknown"], help=argparse.SUPPRESS)
     ap.add_argument("--fake-hw", help=argparse.SUPPRESS)   # tests: JSON with gpu/vram_gib/cores/ram_gib/pcie_gen/...
@@ -714,14 +949,19 @@ def parse_args(argv=None):
     return a
 
 
+BUILD_STATE_NEEDLE = b"switched by the page fault rate"   # llama-moe-cache.cpp: a build with the low-RAM fixes
+
+
 def build_state(server_bin):
-    """'new' if libllama.so next to the server has the low-RAM fixes ("switched by the page fault rate"), 'old' if not,
-    'unknown' if no library/binary can be read."""
+    """'new' if the library (or a static binary) next to the server has the low-RAM fixes ("switched by the page
+    fault rate"), 'old' if one was found without them, 'unknown' if nothing could be read.
+    Linux: libllama.so; Windows: llama.dll / ggml*.dll, or llama-server.exe itself."""
     d = os.path.dirname(os.path.realpath(server_bin)) if os.path.exists(server_bin) else None
     if not d:
         return "unknown"
-    cands = sorted(glob.glob(os.path.join(d, "libllama.so*"))) + [os.path.realpath(server_bin)]
-    needle = b"switched by the page fault rate"
+    cands = sorted(glob.glob(os.path.join(d, "libllama.so*"))
+                   + glob.glob(os.path.join(d, "llama.dll"))
+                   + glob.glob(os.path.join(d, "ggml*.dll"))) + [os.path.realpath(server_bin)]
     seen = False
     for c in cands:
         try:
@@ -731,10 +971,11 @@ def build_state(server_bin):
                     buf = f.read(16 << 20)
                     if not buf:
                         break
-                    if needle in tail + buf:
+                    if BUILD_STATE_NEEDLE in tail + buf:
                         return "new"
-                    tail = buf[-len(needle):]
-            seen = seen or "libllama" in c
+                    tail = buf[-len(BUILD_STATE_NEEDLE):]
+            base = os.path.basename(c).lower()
+            seen = seen or "libllama" in base or (IS_WIN and base.startswith(("llama", "ggml")))
         except OSError:
             pass
     return "old" if seen else "unknown"
@@ -783,7 +1024,8 @@ def main(argv=None):
         return 0
     offer_downloads(m, hw, args)
     if not os.path.exists(args.server_bin):
-        sys.exit(f"tandem-run: llama-server not found at {args.server_bin}; build it (build.sh) or pass --server-bin")
+        how = "build.ps1" if IS_WIN else "build.sh"
+        sys.exit(f"tandem-run: llama-server not found at {args.server_bin}; build it ({how}) or pass --server-bin")
     if not args.no_calibrate and (args.calibrate or (calib is None and plan.draft_n)):
         say("== Calibrating (one-off per machine+model; ~ a few model loads) ==")
         res = calibrate(hw, m, args, plan, mk)
@@ -794,11 +1036,20 @@ def main(argv=None):
             argv_, env = mk(plan)
     say("== Launching ==")
     say(f"URL: http://{args.host if args.host != '0.0.0.0' else '127.0.0.1'}:{args.port}/   (OpenAI API at /v1)")
-    say("Command: " + " ".join(f"{k}={shlex.quote(v)}" for k, v in sorted(plan.env.items())) + " " + " ".join(map(shlex.quote, argv_)))
-    proc = subprocess.Popen(argv_, env=env, start_new_session=True)
-    fwd = lambda s, f: os.killpg(proc.pid, signal.SIGTERM)
-    signal.signal(signal.SIGINT, fwd)
-    signal.signal(signal.SIGTERM, fwd)
+    say("Command: " + env_prefix(plan.env) + join_cmd(argv_))
+    proc = subprocess.Popen(argv_, env=env, **spawn_kwargs())
+
+    def forward(signum, frame):
+        stop_group(proc, timeout=10)
+
+    signal.signal(signal.SIGINT, forward)           # both platforms deliver this
+    for name in ("SIGTERM", "SIGBREAK"):             # SIGBREAK on Windows: Ctrl+Break and the console close event
+        sig = getattr(signal, name, None)
+        if sig is not None:
+            try:
+                signal.signal(sig, forward)
+            except (OSError, ValueError):
+                pass
     return proc.wait()
 
 
