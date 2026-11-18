@@ -1438,10 +1438,14 @@ diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
 index 53d39d2..e84e569 100644
 --- a/ggml/src/ggml-cpu/ggml-cpu.c
 +++ b/ggml/src/ggml-cpu/ggml-cpu.c
-@@ -1742,6 +1742,35 @@ static void ggml_compute_forward_mul_mat_id(
+@@ -1742,6 +1742,43 @@ static void ggml_compute_forward_mul_mat_id(
  
  /////////////////////////////////
  
++#if defined(_MSC_VER)
++#include <intrin.h> // _ReadWriteBarrier for the acquire below; GCC/Clang have __atomic_thread_fence
++#endif
++
 +// see ggml_host_add
 +static void ggml_compute_forward_host_add(struct ggml_tensor * dst) {
 +    uint64_t p[2];
@@ -1459,7 +1463,11 @@ index 53d39d2..e84e569 100644
 +            break;
 +        }
 +    }
++#if defined(_MSC_VER)
++    _ReadWriteBarrier(); // on x86-64 a load is already an acquire; this keeps the compiler from moving the data[] read up
++#else
 +    __atomic_thread_fence(__ATOMIC_ACQUIRE);
++#endif
 +    flag[1] = v;
 +    flag[2] = (uint32_t) ((ggml_time_us() - t0)*1000);
 +
@@ -1474,7 +1482,7 @@ index 53d39d2..e84e569 100644
  static void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor) {
      GGML_ASSERT(params);
  
-@@ -2154,6 +2183,21 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
+@@ -2154,6 +2191,21 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                  ggml_compute_forward_opt_step_sgd(params, tensor);
              }
              break;
@@ -1496,7 +1504,7 @@ index 53d39d2..e84e569 100644
          case GGML_OP_NONE:
              {
                  // nop
-@@ -2503,6 +2547,12 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+@@ -2503,6 +2555,12 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
              {
                  n_tasks = n_threads;
              } break;
@@ -2758,8 +2766,8 @@ index 72e961d..519d4ab 100644
 -    cudaError_t err = cudaHostRegister(buffer, size, cudaHostRegisterPortable | cudaHostRegisterReadOnly);
 +    // mapped too: the MoE cache's GPU fetch reads experts in place (LLAMA_MOE_GPU_FETCH)
 +    cudaError_t err = cudaHostRegister(buffer, size, cudaHostRegisterPortable | cudaHostRegisterMapped | cudaHostRegisterReadOnly);
-+    if (err == cudaErrorNotSupported) {
-+        // read-only registration is not available everywhere (asrok/rome: Linux 6.8, driver 615); writable memory still registers
++    if (err != cudaSuccess) {
++        // read-only registration is not available everywhere (asrok/rome: Linux 6.8, driver 615; elsewhere cudaErrorInvalidValue); writable memory still registers
 +        (void)cudaGetLastError();
 +        err = cudaHostRegister(buffer, size, cudaHostRegisterPortable | cudaHostRegisterMapped);
 +    }
@@ -5902,7 +5910,7 @@ index 81af890..b828a69 100644
      pimpl->mappings.reserve(ml.mappings.size());
  
      // create the backend buffers
-@@ -2063,10 +2093,474 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+@@ -2063,10 +2093,478 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
      }
  
      load_tensors_hadamard();
@@ -6006,7 +6014,11 @@ index 81af890..b828a69 100644
 +        }
 +    }
 +    // ggml-cuda registers host memory only with GGML_CUDA_REGISTER_HOST set (read once, at its first use; nothing else here uses it)
++#if defined(_WIN32)
++    _putenv_s("GGML_CUDA_REGISTER_HOST", "1");   // _putenv_s has no overwrite flag; ggml-cuda reads this variable once, on first use
++#else
 +    setenv("GGML_CUDA_REGISTER_HOST", "1", 0);
++#endif
 +    // whole pages around the table (inside the same mapping or allocation)
 +    const size_t page = 4096;
 +    const uintptr_t b = (uintptr_t) per_layer_tok_embd->data & ~(uintptr_t) (page - 1);
@@ -9191,11 +9203,11 @@ index 6a343a7..2530b8b 100644
 +            return;
 +        }
 +        stats_t = now;
-+        struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
++        const double t_wall = std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
 +        fprintf(stats_f, "{\"t\": %.3f, \"cpu_job_us\": %.0f, \"cpu_pairs\": %zu, \"cpu_experts\": %zu, \"up_bytes\": %zu, \"copy_bytes\": %zu, "
 +            "\"hits\": %zu, \"misses\": %zu, \"flag_wait_us\": %.0f, \"la_issued\": %zu, \"pf_job_us\": %.0f, \"pf_cpu\": %zu, \"share\": %.3f, "
 +            "\"calls\": %zu, \"sync_us\": %.0f, \"plan_us\": %.0f}\n",
-+            ts.tv_sec + ts.tv_nsec*1e-9, t_cpu_us + t_pf_job_us, n_cpu_pairs + n_pf_pairs, n_cpu_experts + n_pf_cpu,
++            t_wall, t_cpu_us + t_pf_job_us, n_cpu_pairs + n_pf_pairs, n_cpu_experts + n_pf_cpu,
 +            stats_small.bytes + stats_large.bytes, stats_copy.bytes, stats_small.hits, stats_small.misses, t_flag_wait_us + t_pf_wait_us,
 +            n_la_issued, t_pf_job_us, n_pf_cpu, hybrid_share, n_hybrid_calls, t_sync_us, t_upload_us);
 +        fflush(stats_f);
