@@ -53,7 +53,7 @@ through a portable API.
 
 The patch is far more portable than the original plan assumed. Counted in `tandem.patch`: 25
 `#ifdef __linux__`, 2 `#ifndef __linux__`, 3 pre-existing `_WIN32` branches (`common/arg.cpp` twice,
-`common/common.cpp` once), 2 x86 guards and 4 `#if defined(GGML_USE_VMM)` blocks.
+`common/common.cpp` once), 2 x86 guards and 5 `#if defined(GGML_USE_VMM)` blocks.
 
 | Area | Guarded code | Behaviour off Linux |
 |---|---|---|
