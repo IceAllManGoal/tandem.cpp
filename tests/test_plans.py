@@ -1,5 +1,8 @@
-"""Plan tests with fake hardware (no GPU, no files needed). Run: python3 -m unittest discover -s tests -v"""
-import importlib.util, io, contextlib, json, os, unittest
+"""Plan tests with fake hardware (no GPU, no files needed). Run: python -m unittest discover -s tests -v
+
+Portable: the same tests run on Linux and Windows.
+"""
+import importlib.util, io, contextlib, json, os, shutil, tempfile, unittest
 spec = importlib.util.spec_from_file_location("tr", os.path.join(os.path.dirname(__file__), "..", "tandem-run.py"))
 tr = importlib.util.module_from_spec(spec); spec.loader.exec_module(tr)
 
@@ -48,7 +51,12 @@ class T(unittest.TestCase):
             tr.main(["--model", "qwen3.8", "--dry-run", "--fake-hw", json.dumps(PROFILES["pc-16"])])
         self.assertIn("== Command ==", buf.getvalue())
     def test_generic_unknown_file(self):
-        p = os.path.join(os.path.dirname(__file__), "fake-model.gguf"); f = open(p, "wb"); f.write(b"junk"); f.truncate(40 << 30); f.close()  # sparse 40 GiB
+        p = os.path.join(os.path.dirname(__file__), "fake-model.gguf")
+        try:
+            with open(p, "wb") as f:
+                f.truncate(40 << 30)      # sparse on NTFS and on the usual Linux filesystems: nothing is written
+        except OSError:
+            self.skipTest("this filesystem cannot create a sparse 40 GiB file")
         try:
             s, _ = plan(p, "i9-4090-128")
             self.assertIn("-cmoe", s); self.assertNotIn("--spec-type", s)
@@ -92,11 +100,13 @@ class T(unittest.TestCase):
         def start(argv, env, log): cur["n"] = int(argv[argv.index("--spec-draft-n-max") + 1]); tried.append(cur["n"]); return P()
         tr.start_server, tr.wait_ready, tr.stop_group = start, (lambda p, port, timeout=0: True), (lambda p: None)
         tr.measure = lambda port, n=200: speeds[cur["n"]]
-        tr.CACHE_DIR = "/tmp/tandem-test-cache"
+        cache = tempfile.mkdtemp(prefix="tandem-test-cache-")    # portable: no /tmp on Windows
+        tr.CACHE_DIR = cache
         try:
             res = tr.calibrate(hw, m, a, pl, lambda p: (["llama-server", *p.args], {}))
         finally:
             tr.start_server, tr.wait_ready, tr.measure, tr.stop_group, tr.CACHE_DIR = orig
+            shutil.rmtree(cache, ignore_errors=True)
         return res, tried
 
     def test_calibration_n_minus_1_only_with_flag(self):

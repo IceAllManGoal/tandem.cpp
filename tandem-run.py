@@ -981,6 +981,16 @@ def build_state(server_bin):
     return "old" if seen else "unknown"
 
 
+def apply_assumes(hw, args):
+    """--assume-*: compute the rules for another machine. detect() already did this on real hardware; this is the
+    fake-hardware path, and it is what the tests call."""
+    for flag, key in (("assume_vram_gib", "vram_gib"), ("assume_ram_gib", "ram_gib"), ("assume_cores", "cores")):
+        value = getattr(args, flag)
+        if value is not None:
+            hw["emulated"].append(key.split("_")[0])
+            hw[key] = value
+
+
 def make_plan(args):
     """Everything up to (not including) starting a server; the unit tests call this."""
     if args.fake_hw:
@@ -1006,10 +1016,7 @@ def main(argv=None):
     hw, m = make_plan(args)
     if args.assume_vram_gib is not None or args.assume_ram_gib is not None or args.assume_cores is not None:
         if args.fake_hw:     # apply the same overrides on fake hardware
-            for flag, key in (("assume_vram_gib", "vram_gib"), ("assume_ram_gib", "ram_gib"), ("assume_cores", "cores")):
-                if getattr(args, flag) is not None:
-                    hw["emulated"].append(key.split("_")[0])
-                    hw[key] = getattr(args, flag)
+            apply_assumes(hw, args)
     key = calib_key(hw, m, args)
     calib = None if (args.calibrate or args.no_calibrate) else load_calib(key)
     plan = choose_flags(hw, m, args, calib)
