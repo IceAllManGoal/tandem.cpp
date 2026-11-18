@@ -1047,7 +1047,13 @@ def main(argv=None):
     proc = subprocess.Popen(argv_, env=env, **spawn_kwargs())
 
     def forward(signum, frame):
-        stop_group(proc, timeout=10)
+        if IS_WIN:
+            stop_group(proc, timeout=10)                    # no process group to signal the POSIX way
+        else:
+            try:                                            # unchanged Linux behaviour: SIGTERM to the group
+                os.killpg(proc.pid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
 
     signal.signal(signal.SIGINT, forward)           # both platforms deliver this
     for name in ("SIGTERM", "SIGBREAK"):             # SIGBREAK on Windows: Ctrl+Break and the console close event
